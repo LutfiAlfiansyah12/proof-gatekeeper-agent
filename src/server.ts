@@ -303,9 +303,13 @@ function onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
     const sigHeader = req.headers['x-agent-games-signature'];
     const verify = verifyHmac(rawBody, Array.isArray(sigHeader) ? sigHeader[0] : sigHeader, config.hmacSecret);
     if (!verify.valid) {
+      // The signature header VALUE is not a secret — log it to diagnose
+      // format mismatches with the platform (hex vs base64 vs prefix).
       log.warn('signature verification FAILED — rejecting', {
         path: req.url,
         bytes: rawBody.length,
+        receivedHeader: Array.isArray(sigHeader) ? sigHeader[0] : sigHeader,
+        secretLength: config.hmacSecret.length,
       });
       res.statusCode = 401;
       signResponse(res, Buffer.from(JSON.stringify({ error: 'invalid signature' }), 'utf8'), 'sha256');
