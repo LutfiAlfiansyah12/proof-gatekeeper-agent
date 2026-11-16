@@ -1,75 +1,101 @@
-# Runbook: Pasang Proof Gatekeeper TANPA MENYENTUH VFY
+# Runbook (DARI NOL): Proof Gatekeeper di VPS yang sudah ada VFY-nya
 
-Kondisi VPS: VFY sudah jalan (compose `/root/steal-the-vfy-agent`, caddy
-docker-nya pegang port 80/443). Runbook ini **additive-only**: gatekeeper
-menumpang di belakang Caddy milik VFY.
+Semua sebagai `root`, dijalankan lewat SSH. Setiap perintah aman dijalankan
+ulang (idempotent). VFY yang sudah jalan **tidak disentuh sama sekali** —
+satu-satunya perubahan pada VFY adalah SATU blok route di Caddyfile-nya
+(opsi A) yang di-apply dengan hot-reload tanpa memutus koneksi.
 
 ```
-Docker Caddy milik VFY (TIDAK DISENTUH, tetap pemilik :80/:443)
-├── route VFY lama → agent:3000                (tidak disentuh)
-└── /gatekeeper/* → <gateway-ip>:8081          (SATU-SATUNYA yang ditambahkan)
-                       │
-                       └── gatekeeper (systemd, di host)
+VPS (Ubuntu, root)
+├── [Docker — milik VFY, TIDAK DISENTUH]
+│   ├── caddy (VFY)  ← pemilik :80/:443, pintu TLS satu-satunya
+│   │     ├── route VFY lama → agent:3000        (tidak disentuh)
+│   │     └── /gatekeeper/* → <gw-ip>:8081       (DITAMBAHKAN — langkah 6)
+│   └── agent (VFY, :3000 internal)              (tidak disentuh)
+└── gatekeeper (systemd, :8081)                  ← yang kita pasang (langkah 3-4)
 ```
 
-## ⛔ ATURAN EMAS — jangan pernah lakukan ini
+## ⛔ 4 LARANGAN (pelanggaran = VFY putus)
 
-1. **Jangan** `systemctl start/enable caddy` di HOST (bentrok dengan caddy docker)
-2. **Jangan** stop/rm/restart container docker apapun (`docker compose down/up`, `docker restart`)
-3. **Jangan** edit `docker-compose.yml` VFY, image, volume, atau environment VFY
-4. **Jangan** edit bagian lain Caddyfile VFY — hanya **menambah** satu blok route
-
-Pelanggaran #2/#3 = VFY putus sesaat dan bisa gagal preflight. Cukup langkah
-di bawah — semuanya tidak menyentuh VFY kecuali satu blok teks di Caddyfile-nya
-yang di-reload **tanpa memutus koneksi**.
+1. Jangan `systemctl start/enable caddy` di HOST
+2. Jangan `docker restart/down/up/stop` apapun
+3. Jangan edit docker-compose.yml / image / env VFY
+4. Jangan ubah baris lama di Caddyfile VFY — hanya TAMBAH satu blok
 
 ---
 
-## Langkah 1 — SSH (dari PowerShell laptop)
+## Langkah 1 — SSH masuk (dari PowerShell laptop)
 
 ```powershell
 ssh root@16.179.122.5
 ```
 
-## Langkah 2 — Update kode gatekeeper
+(Semua langkah berikutnya di dalam VPS, prompt `root@ip-...:~#`.)
+
+## Langkah 2 — Install dependensi (aman diulang)
+
+```bash
+apt-get update
+apt-get install -y curl git
+
+# Node.js 22 (kalau `node -v` sudah >= 22, blok ini boleh dilewati)
+curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+apt-get install -y nodejs
+
+node -v    # harus >= 22
+```
+
+## Langkah 3 — Clone + build gatekeeper
+
+```bash
+cd /root
+[ -d zkverify ] || git clone https://github.com/LutfiAlfiansyah12/proof-gatekeeper-agent.git zkverify
+cd /root/zkverify
+git pull
+npm ci
+npm run build
+```
+
+## Langkah 4 — .env gatekeeper
 
 ```bash
 cd /root/zkverify
-git pull
-npm ci && npm run build
-```
-
-## Langkah 3 — .env gatekeeper: PORT 8081, HOST 0.0.0.0
-
-```bash
+[ -f .env ] || cp .env.example .env
+chmod 600 .env
 nano /root/zkverify/.env
 ```
 
-Pastikan nilai ini (baris lain boleh tetap):
+Pastikan nilai-nilai ini:
 
 ```ini
 AGENT_GAMES_HMAC_SECRET=string-random-apa-saja-dulu
+KURIER_API_KEY=
 HOST=0.0.0.0
 PORT=8081
 AGENT_PATH=/agent
+LOG_LEVEL=info
 APPROVAL_REQUIRE_FINALIZED=false
 ```
 
-> Kenapa `0.0.0.0`: traffic dari container docker masuk lewat interface
-> bridge, bukan loopback — kalau bind 127.0.0.1, Caddy VFY tidak akan bisa
-> mencapai gatekeeper. Tetap aman dari internet karena AWS Security Group
-> hanya membuka 22/80/443.
+> `HOST=0.0.0.0` itu wajib di setup ini: traffic dari container docker Caddy
+> milik VFY masuk lewat bridge interface, bukan loopback. Tetap tidak bisa
+> diakses internet karena AWS SG hanya membuka 22/80/443.
+> Secret asli diisi di langkah 10 (Rotate Secret).
 
-## Langkah 4 — Jalankan & verifikasi gatekeeper (lokal)
+## Langkah 5 — Service systemd + verifikasi lokal
 
 ```bash
+cp /root/zkverify/deploy/gatekeeper.service /etc/systemd/system/
 systemctl daemon-reload
-systemctl restart gatekeeper
+systemctl enable --now gatekeeper
+
 systemctl is-active gatekeeper          # → active
 curl -s http://127.0.0.1:8081/health    # → {"ok":true}
 ```
 
-## Langkah 5 — Cari Caddyfile VFY + IP gateway docker
+## Langkah 6 — Pasang route di Caddy milik VFY (satu-satunya sentuhan ke VFY)
+
+**6a. Cari Caddyfile VFY + IP gateway docker:**
 
 ```bash
 find /root/steal-the-vfy-agent -name "Caddyfile" -not -path "*/node_modules/*"
@@ -80,18 +106,17 @@ docker network inspect "$(
 )" --format '{{(index .IPAM.Config 0).Gateway}}'
 ```
 
-Catat dua hal: **path Caddyfile** (mis. `/root/steal-the-vfy-agent/caddy/Caddyfile`)
+Catat: **path Caddyfile** (mis. `/root/steal-the-vfy-agent/caddy/Caddyfile`)
 dan **IP gateway** (mis. `172.18.0.1`).
 
-## Langkah 6 — Tambah SATU blok route di Caddyfile VFY
+**6b. Edit Caddyfile-nya:**
 
 ```bash
-nano <path-Caddyfile-dari-langkah-5>
+nano <path-Caddyfile>
 ```
 
-Di **dalam blok site yang berisi domain `0xmurasaki.duckdns.org`**, tambahkan
-(satu blok ini saja — jangan sentuh baris lain; indentasi pakai tab sama
-seperti blok di sekitarnya):
+Di **dalam blok site** yang berisi domain `0xmurasaki.duckdns.org`, TAMBAHKAN
+(jangan ubah baris lain; indentasi tab, konsisten dengan blok sekitarnya):
 
 ```caddyfile
 	handle_path /gatekeeper/* {
@@ -99,64 +124,69 @@ seperti blok di sekitarnya):
 	}
 ```
 
-Ganti `172.18.0.1` dengan IP gateway hasil langkah 5.
+(ganti `172.18.0.1` dengan IP gateway yang tadi dicatat)
 
-## Langkah 7 — Hot-reload Caddy VFY (TANPA restart container!)
+## Langkah 7 — Hot-reload Caddy VFY (graceful, TANPA restart container)
 
 ```bash
 docker exec steal-the-vfy-agent-caddy-1 \
   caddy reload --config /etc/caddy/Caddyfile
 ```
 
-> `reload` = graceful, koneksi aktif tidak diputus — VFY tidak terganggu.
-> Kalau error "file not found", cek config mana yang di-mount:
+> Kalau error "file not found", cek mount aslinya:
 > `docker inspect steal-the-vfy-agent-caddy-1 --format '{{json .Mounts}}'`
-> lalu gunakan path source-nya sebagai `--config`.
-> **Jangan** pakai `docker restart` / `compose restart` sebagai gantinya.
+> lalu pakai path source sebagai `--config`.
+> **Jangan pakai docker restart / compose restart sebagai gantinya.**
 
 ## Langkah 8 — Verifikasi
 
 Di VPS:
 ```bash
-docker exec steal-the-vfy-agent-caddy-1 \
-  wget -qO- --header "Host: 0xmurasaki.duckdns.org" http://127.0.0.1:8080/gatekeeper/agent || true
-# yang penting: ada RESPONSE (401/404 juga bagus) — berarti route hidup
+curl -s http://127.0.0.1:8081/health    # {"ok":true} (gatekeeper hidup)
 ```
 
 Dari PowerShell laptop:
 ```powershell
-curl.exe -i https://0xmurasaki.duckdns.org/gatekeeper/agent
-# HTTP 401 {"error":"invalid signature"}  ← TEPAT! berarti sampai ke HMAC gate
 curl.exe -i https://0xmurasaki.duckdns.org/health
-# {"ok":true} — gatekeeper via pintu VFY
+# {"ok":true} — gatekeeper terpapar publik lewat pintu VFY
+
+curl.exe -i https://0xmurasaki.duckdns.org/gatekeeper/agent
+# HTTP 401 {"error":"invalid signature"} ← TEPAT, HMAC guard aktif
+
+# dan VFY tetap normal:
+curl.exe -i https://0xmurasaki.duckdns.org/vfy/<path-vfy>
 ```
 
-## Langkah 9 — Registrasi di dashboard
+## Langkah 9 — Registrasi dashboard
 
 1. My Agents → daftarkan endpoint **lengkap**:
    `https://0xmurasaki.duckdns.org/gatekeeper/agent`
-2. Link repo GitHub: `https://github.com/LutfiAlfiansyah12/proof-gatekeeper-agent`
-3. Pilih event **Proof Gatekeeper**.
+2. Link repo: `https://github.com/LutfiAlfiansyah12/proof-gatekeeper-agent`
+3. Pilih event Proof Gatekeeper.
 
-## Langkah 10 — Rotate Secret (baru nilai asli masuk)
+## Langkah 10 — Rotate Secret → preflight
 
 1. Dashboard → Rotate Secret → salin (tampil sekali)
 2. VPS:
    ```bash
-   nano /root/zkverify/.env        # ganti AGENT_GAMES_HMAC_SECRET
+   nano /root/zkverify/.env     # ganti AGENT_GAMES_HMAC_SECRET nilai asli
    systemctl restart gatekeeper
    ```
-3. Trigger **preflight** dari dashboard, pantau:
+3. Trigger preflight dari dashboard; pantau:
    ```bash
-   journalctl -u gatekeeper -f     # harus muncul: preflight received
+   journalctl -u gatekeeper -f  # muncul: preflight received
    ```
+   Status agent di dashboard jadi **active**.
 
-## Langkah 11 — Practice mode
+## Langkah 11 — Practice mode (WAJIB sebelum ronda skor)
 
-Jalankan task practice sambil `journalctl -u gatekeeper -f`. Kalau bukti
-dinilai invalid → `.env` → `TASKID_FIELD_MODE=digits` (atau `numeric`) →
-restart → coba lagi. Setelah `KURIER_API_KEY` ada dan practice mulus:
-`.env` → `APPROVAL_REQUIRE_FINALIZED=true` → restart.
+Jalankan task practice sambil `journalctl -u gatekeeper -f`.
+
+| Gejala | Perbaikan |
+|---|---|
+| Bukti invalid / decision salah | `.env` → `TASKID_FIELD_MODE=digits` (atau `numeric`/`zero`) → restart → coba lagi |
+| Semua `PROOF_REUSED` | `rm /root/zkverify/data/seen-proof-tx.json` → restart |
+| Kurier macet | Isi `KURIER_API_KEY`; setelah practice mulus: `APPROVAL_REQUIRE_FINALIZED=true` → restart |
 
 ## Update saat kompetisi
 
@@ -169,8 +199,10 @@ cd /root/zkverify && git pull && npm ci && npm run build \
 
 | Gejala | Solusi |
 |---|---|
-| Caddy reload error "file not found" | Gunakan path mount asli (lihat langkah 7) |
-| `curl /gatekeeper/agent` timeout | Gateway IP salah → ulangi langkah 5; atau gatekeeper mati → langkah 4 |
-| 502 di `/gatekeeper/*` | Gatekeeper bind salah — pastikan `HOST=0.0.0.0` |
-| Preflight signature error | Secret `.env` ≠ dashboard → Rotate ulang → restart |
-| 404 dari route VFY | Blok belum di dalam site block yang benar / indentasi salah |
+| `npm ci` gagal | Node belum versi 22 → ulangi langkah 2 |
+| Service `activating` terus | `journalctl -u gatekeeper -n 30 --no-pager`; cek `.env` ada |
+| `status=226/NAMESPACE` | `mkdir -p /root/zkverify/data` → restart (unit baru sudah auto) |
+| Caddy reload "file not found" | Path config salah → lihat `docker inspect ... Mounts` (langkah 7) |
+| `/gatekeeper/*` timeout/502 | Gateway IP salah (ulangi 6a) atau gatekeeper mati (ulangi 5) |
+| Preflight signature error | Secret ≠ dashboard → Rotate ulang → restart (langkah 10) |
+| Preflight 404 | Endpoint harus `/gatekeeper/agent` (dengan prefix) |
