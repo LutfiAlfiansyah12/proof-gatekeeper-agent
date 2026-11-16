@@ -17,9 +17,11 @@ Restart=always
 RestartSec=3
 EnvironmentFile=/root/zkverify/.env
 
+# Catatan: ReadWritePaths sengaja tidak dipakai — systemd memvalidasi path-nya
+# SEBELUM ExecStartPre, jadi folder yang belum ada bikin status=226/NAMESPACE.
+# Sebagai root, hardening folder tidak diperlukan.
 NoNewPrivileges=true
 PrivateTmp=true
-ReadWritePaths=/root/zkverify/data
 
 # Log ke journald — lihat dengan: journalctl -u gatekeeper -f
 StandardOutput=journal
