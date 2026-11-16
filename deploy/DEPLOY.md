@@ -1,201 +1,191 @@
-# Deploy VPS AWS (Ubuntu) — Proof Gatekeeper Agent (+ slot agent VFY)
+# Runbook DARI NOL — VPS BARU khusus Proof Gatekeeper (standalone)
 
-**Semua dijalankan sebagai `root` di `/root/zkverify`.** Source dari GitHub,
-tidak ada scp.
-
-| Item | Nilai |
-|---|---|
-| Repo | https://github.com/LutfiAlfiansyah12/proof-gatekeeper-agent |
-| Domain | `0xmurasaki.duckdns.org` (DuckDNS) |
-| Gatekeeper | systemd, `127.0.0.1:8081` |
-| Agent VFY | docker, `127.0.0.1:8080` |
-| Pintu depan | **Caddy** — satu-satunya pemilik port `:80` + `:443` |
+VPS baru = bersih. Tidak ada Docker VFY, tidak ada konflik port. Caddy
+menjadi satu-satunya pemilik port 80/443. Gatekeeper di `127.0.0.1:8080`.
 
 ```
-Platform → https://0xmurasaki.duckdns.org/<event>/agent
-              │ Caddy :443 (TLS otomatis, routing by path)
-              ├── /gatekeeper/* → 127.0.0.1:8081
-              └── /vfy/*        → 127.0.0.1:8080
+Platform → https://<subdomain>.duckdns.org/agent
+              │ Caddy :443 (TLS otomatis)
+              └── 127.0.0.1:8080 (gatekeeper, systemd)
 ```
 
-> ⚠️ **Aturan emas: tidak boleh ada proses lain yang mempublish port 80/443
-> di host.** Container Docker VFY yang meng-bind `0.0.0.0:80`/`:443` harus
-> digeser (Langkah 4). Kalau Docker menyita 80/443, Caddy tidak bisa start
-> (`bind: address already in use`).
+> ⚠️ **Domain:** buat SUBDOMAIN BARU di duckdns.org (misal `0xmurasaki-gk`)
+> dan arahkan ke IP VPS baru. Jangan pindahkan subdomain yang sedang dipakai
+> VFY di VPS lama. Di runbook ini dipakai `0xmurasaki-gk.duckdns.org` —
+> ganti konsisten dengan milikmu.
 
 ---
 
-## Langkah 0 — SSH masuk (dari PowerShell laptop)
+## Langkah 0 — AWS Console (sekali)
 
+1. Instance EC2 Ubuntu (t2.small/t3.small disarankan, 1 vCPU cukup)
+2. Security Group inbound:
+
+| Type | Port | Source |
+|---|---|---|
+| SSH | 22 | IP kamu |
+| HTTP | 80 | 0.0.0.0/0 |
+| HTTPS | 443 | 0.0.0.0/0 |
+
+3. Catat **Public IPv4**.
+
+## Langkah 1 — DuckDNS (dari browser, sekali)
+
+1. Login duckdns.org → buat subdomain baru (misal `0xmurasaki-gk`)
+2. Isi IP-nya dengan Public IPv4 VPS baru
+
+Verifikasi (PowerShell):
 ```powershell
-ssh root@16.179.122.5
+Resolve-DnsName 0xmurasaki-gk.duckdns.org   # harus = IP VPS baru
 ```
 
-Semua perintah berikutnya **di dalam VPS sebagai root**.
+## Langkah 2 — SSH masuk
 
-## Langkah 1 — Install Node.js 22 + git + Caddy
+```powershell
+ssh root@<IP-VPS-BARU>
+# kalau instance hanya mengizinkan user ubuntu:
+#   ssh ubuntu@<IP> lalu `sudo -i`
+```
+
+Semua langkah berikutnya **di VPS sebagai root**.
+
+## Langkah 3 — Install Node.js 22 + git + Caddy
 
 ```bash
+apt-get update
+apt-get install -y curl git
+
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-apt-get install -y nodejs git
+apt-get install -y nodejs
 
 apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
 apt-get update && apt-get install -y caddy
 
-node -v    # >= 22
+node -v    # harus >= 22
 ```
 
-## Langkah 2 — Clone repo & build gatekeeper
+## Langkah 4 — Clone + build
 
 ```bash
 cd /root
 git clone https://github.com/LutfiAlfiansyah12/proof-gatekeeper-agent.git zkverify
-cd zkverify
+cd /root/zkverify
 npm ci
 npm run build
 ```
 
-## Langkah 3 — .env gatekeeper (PORT = 8081!)
+(`artifacts/` wasm+zkey ikut di repo — tidak perlu download ulang.)
+
+## Langkah 5 — .env
 
 ```bash
 cp .env.example .env
 chmod 600 .env
-nano .env
+nano /root/zkverify/.env
 ```
 
 ```ini
-AGENT_GAMES_HMAC_SECRET=isi-string-random-dulu-ganti-setelah-rotate-secret
+AGENT_GAMES_HMAC_SECRET=string-random-apa-saja-dulu
 KURIER_API_KEY=
 
 HOST=127.0.0.1
-PORT=8081
+PORT=8080
 AGENT_PATH=/agent
 LOG_LEVEL=info
 
 APPROVAL_REQUIRE_FINALIZED=false
 ```
 
-## Langkah 4 — Geser Docker VFY dari port 80/443 (sekali saja)
+> `AGENT_GAMES_HMAC_SECRET` wajib ada isinya supaya service bisa start.
+> Nilai asli diisi di Langkah 9 setelah Rotate Secret.
+> `APPROVAL_REQUIRE_FINALIZED=false` dulu selama practice; ganti `true`
+> setelah `KURIER_API_KEY` terisi dan pipeline terbukti jalan.
 
-Container VFY tidak boleh lagi mempublish 80/443 ke host. Dia cukup
-terpublikasi sebagai `127.0.0.1:8080`.
-
-**Kalau pakai docker compose** — cari file `docker-compose.yml` container VFY
-(`docker inspect <nama-container> | grep -A5 Compose` kalau ragu), ubah
-bagian `ports:`:
-
-```yaml
-ports:
-  - "127.0.0.1:8080:8080"   # host:container — sesuaikan angka kanan
-                            # dengan port internal container VFY
-```
-
-lalu:
-
-```bash
-cd <folder-compose-vfy>
-docker compose up -d
-```
-
-**Kalau docker run manual** — stop container, jalankan ulang dengan mapping
-baru (contoh, sesuaikan image + port internal):
-
-```bash
-docker stop <container-vfy> && docker rm <container-vfy>
-docker run -d --name <container-vfy> --restart unless-stopped \
-  -p 127.0.0.1:8080:8080 <image-vfy> <args-sebelumnya>
-```
-
-Verifikasi tidak ada lagi yang megang 80/443:
-
-```bash
-ss -tlnp | grep -E ":443 |:80 "    # output harus KOSONG
-docker ps                          # VFY jalan dengan -p 127.0.0.1:8080:...
-```
-
-## Langkah 5 — Service systemd gatekeeper
+## Langkah 6 — Service systemd
 
 ```bash
 cp /root/zkverify/deploy/gatekeeper.service /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now gatekeeper
 
-systemctl is-active gatekeeper        # → active
-curl -s http://127.0.0.1:8081/health  # → {"ok":true}
+systemctl is-active gatekeeper          # → active
+curl -s http://127.0.0.1:8080/health    # → {"ok":true}
 ```
 
-## Langkah 6 — Caddy (pintu depan TLS)
+(Unit otomatis membuat `/root/zkverify/data` untuk proof-reuse store.)
+
+## Langkah 7 — Caddy (pintu TLS)
 
 ```bash
-cp /root/zkverify/deploy/Caddyfile /etc/caddy/Caddyfile
+cp /root/zkverify/deploy/Caddyfile-standalone /etc/caddy/Caddyfile
+nano /etc/caddy/Caddyfile     # pastikan domain = subdomain kamu
 systemctl enable --now caddy
-journalctl -u caddy -n 20 --no-pager  # cari: certificate obtained successfully
+
+journalctl -u caddy -n 20 --no-pager   # cari: certificate obtained successfully
+curl -s http://127.0.0.1/health -H "Host: 0xmurasaki-gk.duckdns.org"   # {"ok":true}
 ```
 
-Verifikasi routing di VPS:
-
-```bash
-curl -s http://127.0.0.1/health -H "Host: 0xmurasaki.duckdns.org"   # gatekeeper {"ok":true}
-curl -s http://127.0.0.1/vfy/<path-vfy> -H "Host: 0xmurasaki.duckdns.org"   # sampai ke docker VFY
-```
-
-## Langkah 7 — Verifikasi publik (PowerShell laptop)
+## Langkah 8 — Verifikasi publik (PowerShell laptop)
 
 ```powershell
-curl.exe -i https://0xmurasaki.duckdns.org/health          # gatekeeper → {"ok":true}
-curl.exe -i https://0xmurasaki.duckdns.org/vfy/<path-vfy>  # VFY
+curl.exe -i https://0xmurasaki-gk.duckdns.org/health
+# HTTP 200 {"ok":true} dengan sertifikat valid
+
+curl.exe -i https://0xmurasaki-gk.duckdns.org/agent
+# HTTP 401 {"error":"invalid signature"} ← TEPAT! HMAC guard aktif
 ```
 
-## Langkah 8 — Registrasi dashboard (per event)
+Kalau keduanya sesuai → endpoint siap.
 
-| Event | Endpoint yang didaftarkan |
-|---|---|
-| Proof Gatekeeper | `https://0xmurasaki.duckdns.org/gatekeeper/agent` |
-| Steal the VFY | `https://0xmurasaki.duckdns.org/vfy/<path-vfy-agent>` |
+## Langkah 9 — Registrasi + Rotate Secret + preflight
 
-> `handle_path` membuang prefix: `/gatekeeper/agent` tiba di agent sebagai
-> `/agent` (sesuai `AGENT_PATH=/agent`). Sama polanya untuk VFY.
-> Isi link repo GitHub sesuai repo masing-masing agent.
-
-## Langkah 9 — Rotate Secret (per agent!)
-
-Tiap agent punya secret sendiri:
-
-1. Dashboard → My Agents → pilih agent → **Rotate Secret** → salin (tampil sekali)
-2. Gatekeeper: `nano /root/zkverify/.env` → ganti `AGENT_GAMES_HMAC_SECRET` →
-   `systemctl restart gatekeeper`
-3. VFY: update secret di `.env`/config container-nya → `docker compose up -d`
-   (atau restart container)
-4. Trigger **preflight** kedua agent dari dashboard; pantau:
-   ```bash
-   journalctl -u gatekeeper -f        # harus muncul: preflight received
-   docker logs -f <container-vfy>     # idem untuk VFY
+1. Dashboard Agent Games → My Agents → daftarkan endpoint **lengkap**:
    ```
+   https://0xmurasaki-gk.duckdns.org/agent
+   ```
+2. Link repo GitHub:
+   `https://github.com/LutfiAlfiansyah12/proof-gatekeeper-agent`
+3. Pilih event **Proof Gatekeeper**.
+4. **Rotate Secret** → salin (tampil sekali) → di VPS:
+   ```bash
+   nano /root/zkverify/.env    # ganti AGENT_GAMES_HMAC_SECRET
+   systemctl restart gatekeeper
+   ```
+5. Trigger **preflight** dari dashboard; pantau:
+   ```bash
+   journalctl -u gatekeeper -f   # muncul: preflight received
+   ```
+   Status agent di dashboard jadi **active**.
 
 ## Langkah 10 — Practice mode (WAJIB sebelum ronda skor)
 
+Jalankan task practice sambil `journalctl -u gatekeeper -f`.
+
 | Gejala | Perbaikan |
 |---|---|
-| Bukti invalid / decision salah (gatekeeper) | `.env` → `TASKID_FIELD_MODE=digits` (atau `numeric`/`zero`) → restart |
+| Bukti invalid / decision salah | `.env` → `TASKID_FIELD_MODE=digits` (atau `numeric`/`zero`) → restart → coba lagi |
 | Semua `PROOF_REUSED` | `rm /root/zkverify/data/seen-proof-tx.json` → restart |
-| Kurier macet | Set `KURIER_API_KEY` + `APPROVAL_REQUIRE_FINALIZED=true` setelah practice mulus |
+| Kurier macet | Isi `KURIER_API_KEY`; setelah practice mulus: `APPROVAL_REQUIRE_FINALIZED=true` → restart |
 
 ## Update saat kompetisi
 
 ```bash
-cd /root/zkverify && git pull && npm ci && npm run build && systemctl restart gatekeeper
+cd /root/zkverify && git pull && npm ci && npm run build \
+  && systemctl restart gatekeeper
 ```
 
-## Troubleshooting cepat
+## Troubleshooting
 
-| Gejala | Penyebab → solusi |
+| Gejala | Cek |
 |---|---|
-| Caddy `bind: address already in use` | Ada proses lain (biasanya docker-proxy) megang 80/443 → Langkah 4 |
-| `ss` menunjukkan docker-proxy di 80/443 | Container VFY publish host port → hapus mapping 80/443-nya |
-| gatekeeper `activating` terus | `journalctl -u gatekeeper -n 30 --no-pager`; cek `.env` ada & `PORT` tidak bentrok |
-| `Failed to load environment files` | `.env` belum ada di `/root/zkverify/.env` |
-| Preflight 404 | Endpoint registrasi harus **dengan prefix** (`/gatekeeper/agent`) |
-| Preflight signature error | Secret ≠ dashboard → Rotate ulang → restart service |
-| 502 pada `/vfy/*` | Container VFY tidak jalan / salah port internal |
+| `npm ci` gagal | Node versi (`node -v` ≥ 22) → ulangi Langkah 3 |
+| Service `activating` terus | `journalctl -u gatekeeper -n 30 --no-pager`; `.env` ada? |
+| `status=226/NAMESPACE` | `mkdir -p /root/zkverify/data` → restart |
+| Caddy gagal bind | Tidak boleh ada proses lain di 80/443 → `ss -tlnp \| grep -E ':443 \|:80 '` |
+| Sertifikat gagal terbit | Port 80 terbuka? DNS benar? → `journalctl -u caddy -n 50` |
+| `/health` OK di VPS, gagal dari laptop | SG port 443; DNS DuckDNS; `systemctl status caddy` |
+| Preflight 404 | Endpoint registrasi harus persis `/agent` |
+| Preflight signature error | Secret ≠ dashboard → Rotate ulang → restart |
+| REJECT semua `CIRCUIT_MISMATCH` | `EXPECTED_VK_HASH` di `.env` jangan diubah dari default |

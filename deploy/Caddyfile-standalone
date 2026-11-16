@@ -1,0 +1,7 @@
+# Caddyfile — STANDALONE (VPS khusus gatekeeper, tanpa VFY)
+# Letakkan di VPS: /etc/caddy/Caddyfile
+# Ganti domain sesuai subdomain DuckDNS kamu.
+
+0xmurasaki-gk.duckdns.org {
+	reverse_proxy 127.0.0.1:8080
+}
