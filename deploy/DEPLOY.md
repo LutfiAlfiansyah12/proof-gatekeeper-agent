@@ -1,12 +1,26 @@
 # Deploy ke VPS AWS (Ubuntu) — Proof Gatekeeper Agent
 
-Target: EC2 Ubuntu + Caddy (HTTPS otomatis) + systemd (auto-restart).
-Domain contoh: `namakamu.duckdns.org` — ganti dengan domainmu.
+Semua langkah dijalankan **langsung di VPS via SSH** — tidak perlu scp dari
+laptop. Source diambil dari GitHub.
 
-## 0. Persiapan di AWS Console
+- **Repo:** https://github.com/LutfiAlfiansyah12/proof-gatekeeper-agent
+- **Domain:** `0xmurasaki.duckdns.org` (DuckDNS, gratis)
+- **Arsitektur:** Caddy (HTTPS otomatis, :443) → agent (127.0.0.1:8080)
+  Slot `/vfy/*` → :8081 sudah disiapkan untuk agent Steal the VFY nanti.
 
-1. Catat **Public IPv4** instance EC2.
-2. **Security Group** instance → Edit inbound rules, tambahkan:
+```
+Platform (HTTPS, signed) → https://0xmurasaki.duckdns.org/gatekeeper/agent
+                              │ Caddy (TLS, routing by path)
+                              ├── /gatekeeper/* → 127.0.0.1:8080  (agent ini)
+                              └── /vfy/*        → 127.0.0.1:8081  (slot reserved)
+```
+
+> Verifikasi dari laptop yang sudah lulus: DNS resolve benar, port 80 & 443
+> `TcpTestSucceeded : True`. (ICMP/ping memang diblok AWS — abaikan.)
+
+## 0. AWS Security Group (sekali saja, dari Console)
+
+Inbound rules instance EC2:
 
 | Type | Port | Source |
 |---|---|---|
@@ -14,34 +28,21 @@ Domain contoh: `namakamu.duckdns.org` — ganti dengan domainmu.
 | HTTPS | 443 | 0.0.0.0/0 |
 | SSH | 22 | IP kamu saja |
 
-## 1. Domain (DuckDNS — gratis)
+✅ **Sudah dilakukan** (port 80/443 sudah `TcpTestSucceeded : True`).
 
-1. Login [duckdns.org](https://www.duckdns.org) pakai GitHub/Google.
-2. Buat subdomain, misal `namakamu` → jadi `namakamu.duckdns.org`.
-3. Isi IP-nya dengan Public IPv4 EC2.
+## 1. SSH masuk ke VPS (dari PowerShell laptop)
 
-Verifikasi dari laptop:
-```bash
-ping namakamu.duckdns.org   # harus menjawab IP EC2
+```powershell
+ssh ubuntu@16.179.122.5
+# kalau key pair bukan default:
+# ssh -i C:\path\to\keypair.pem ubuntu@16.179.122.5
 ```
 
-## 2. Kirim project ke VPS
+Sisa langkah di bawah ini **semuanya di dalam VPS** (prompt `ubuntu@ip-...:~$`).
 
-Dari Windows (Git Bash), via scp — **JANGAN kirim .env, node_modules, dist**:
-```bash
-cd /d/ZCode/zkVerify
-ssh ubuntu@<IP-EC2> "mkdir -p ~/zkverify"
-scp -r src test deploy artifacts package.json package-lock.json tsconfig.json .gitignore .env.example \
-  ubuntu@<IP-EC2>:~/zkverify/
-```
-
-(Alternatif: push ke private GitHub repo, lalu `git clone` di VPS.)
-
-## 3. Setup di VPS (SSH ke EC2)
+## 2. Install Node.js 22 + Caddy
 
 ```bash
-ssh ubuntu@<IP-EC2>
-
 # Node.js 22 LTS
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs git
@@ -51,93 +52,121 @@ sudo apt-get install -y debian-keyring debian-archive-keyring apt-transport-http
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
 curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
 sudo apt-get update && sudo apt-get install -y caddy
-
-# Build project
-cd ~/zkverify
-npm ci
-npm run build
 ```
 
-## 4. Secrets di VPS
+## 3. Clone repo & build
 
 ```bash
-cd ~/zkverify
+cd ~
+git clone https://github.com/LutfiAlfiansyah12/proof-gatekeeper-agent.git zkverify
+cd zkverify
+npm ci
+npm run build          # menghasilkan dist/ (dist tidak di-commit)
+```
+
+> `artifacts/` (wasm + zkey) sudah ikut di repo — tidak perlu download ulang.
+
+## 4. Buat .env langsung di VPS (secrets TIDAK lewat git)
+
+```bash
 cp .env.example .env
 chmod 600 .env
-nano .env   # isi AGENT_GAMES_HMAC_SECRET (Rotate Secret di dashboard) + KURIER_API_KEY
+nano .env
 ```
 
-Ganti juga di `.env`:
-```
-HOST=127.0.0.1        # Cukup localhost — publiknya lewat Caddy
+Isi/tambahkan nilai-nilai ini:
+
+```ini
+AGENT_GAMES_HMAC_SECRET=<dari dashboard Rotate Secret — tempel di sini>
+KURIER_API_KEY=<kalau sudah ada; boleh dikosongkan dulu>
+
+HOST=127.0.0.1          # penting: cukup localhost, publiknya lewat Caddy
 PORT=8080
-AGENT_PATH=/agent     # HARUS sama dengan yang diregistrasi di dashboard
+AGENT_PATH=/agent       # HARUS persis; jangan diubah
+LOG_LEVEL=info
 ```
 
-> ⚠️ Secret ditempel langsung di VPS via nano — jangan pernah lewat chat/email/screenshot.
+> ⚠️ Secret ditempel langsung via nano di VPS — jangan lewat chat, email,
+> screenshot, atau commit.
 
 ## 5. Jalankan sebagai service (auto-restart)
 
 ```bash
 sudo cp ~/zkverify/deploy/gatekeeper.service /etc/systemd/system/
-# sesuaikan path jika perlu: sudo nano /etc/systemd/system/gatekeeper.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now gatekeeper
-journalctl -u gatekeeper -f        # lihat log live (Ctrl+C untuk keluar)
+journalctl -u gatekeeper -f        # log live (Ctrl+C keluar)
 ```
 
-## 6. Caddy (HTTPS otomatis)
+Cek lokal di VPS:
+```bash
+curl -s http://127.0.0.1:8080/health    # harus: {"ok":true}
+```
+
+## 6. Caddy (HTTPS otomatis + routing dual-agent)
 
 ```bash
 sudo cp ~/zkverify/deploy/Caddyfile /etc/caddy/Caddyfile
-sudo nano /etc/caddy/Caddyfile     # ganti namakamu.duckdns.org dengan domainmu
+sudo nano /etc/caddy/Caddyfile     # pastikan domain 0xmurasaki.duckdns.org
 sudo systemctl reload caddy
 ```
 
-Caddy otomatis dapat sertifikat Let's Encrypt dalam beberapa detik.
+Caddy otomatis minta sertifikat Let's Encrypt (butuh port 80 terbuka — sudah).
 
-## 7. Verifikasi dari laptop
+> Slot `/vfy/*` di Caddyfile boleh aktif sekarang. Kalau port 8081 belum ada
+> yang listen, request ke sana hanya 502 — gatekeeper tidak terpengaruh.
 
-```bash
-# Health check (tanpa signature — hanya untuk ops)
-curl https://namakamu.duckdns.org/health
-# harus jawab: {"ok":true}
+## 7. Verifikasi dari laptop (PowerShell)
 
-# Preflight sungguhan ditrigger dari dashboard (langkah 8)
+```powershell
+curl.exe -i https://0xmurasaki.duckdns.org/health
+# Harap: HTTP/2 200 + {"ok":true} dengan sertifikat valid (tanpa warning TLS)
 ```
 
-## 8. Registrasi & preflight
+## 8. Registrasi agent & preflight (dashboard Agent Games)
 
 1. Dashboard → My Agents → daftarkan endpoint **lengkap**:
-   `https://namakamu.duckdns.org/agent`
-2. **Rotate Secret** → salin nilainya → paste ke `.env` di VPS →
-   `sudo systemctl restart gatekeeper`
-3. Trigger **preflight** dari dashboard → cek log:
-   `journalctl -u gatekeeper -f` harus menampilkan `preflight received`.
-4. Masuk **practice mode** dan jalankan beberapa task sebelum ronda skor.
+   ```
+   https://0xmurasaki.duckdns.org/gatekeeper/agent
+   ```
+   (`handle_path` di Caddy membuang prefix `/gatekeeper`, jadi sampai ke agent
+   sebagai `/agent` — cocok dengan `AGENT_PATH`.)
+2. Isi link repo GitHub: `https://github.com/LutfiAlfiansyah12/proof-gatekeeper-agent`
+3. **Rotate Secret** → salin → paste ke `.env` di VPS (langkah 4) →
+   ```bash
+   sudo systemctl restart gatekeeper
+   ```
+   (Kalau secret sudah diisi sebelum start, lewati restart.)
+4. Trigger **preflight** dari dashboard → log harus menampilkan
+   `preflight received` dan agent jadi **active**.
+5. Jalankan beberapa task di **practice mode** SEBELUM ronda skor.
 
-## 9. Cek pasca-practice (penting)
+## 9. Checklist pasca-practice (penting!)
 
-Perhatikan di log setiap task practice:
-- `engine decision` — cocokkan reason_code dengan ekspektasi
-- Jika platform menandai bukti tidak valid → kemungkinan `TASKID_FIELD_MODE`
-  perlu diganti (`.env` → `digits` / `numeric` / `zero`, lalu restart)
+Perhatikan log (`journalctl -u gatekeeper -f`) untuk tiga hal yang belum
+dikonfirmasi dokumen resmi:
 
-## Troubleshooting cepat
-
-| Gejala | Cek |
-|---|---|
-| `curl /health` gagal | `sudo systemctl status caddy`, security group port 443 |
-| Sertifikat gagal | Port 80 harus terbuka; DNS mengarah ke IP EC2 |
-| Preflight signature error | Secret di `.env` ≠ dashboard (Rotate lagi, restart service) |
-| Agent tidak jalan | `journalctl -u gatekeeper -n 50`, cek Node versi (`node -v` ≥ 20) |
-| REJECT semua task | `CIRCUIT_MISMATCH` → `EXPECTED_VK_HASH` salah; `PROOF_REUSED` salah-salah → hapus `data/seen-proof-tx.json` |
+| Gejala | Kemungkinan penyebab | Perbaikan |
+|---|---|---|
+| Bukti dinilai invalid / decision salah | Derivasi `task_id` → field beda dari asumsi | `.env` → `TASKID_FIELD_MODE=digits` / `numeric` / `zero`, restart |
+| Preflight signature error | Secret `.env` ≠ dashboard | Rotate lagi → update `.env` → restart |
+| Semua task `PROOF_REUSED` | Store reuse basi dari testing | `rm ~/zkverify/data/seen-proof-tx.json` → restart |
 
 ## Patch saat kompetisi
 
 ```bash
 cd ~/zkverify
-# taruh file baru / git pull
+git pull
 npm ci && npm run build
 sudo systemctl restart gatekeeper
 ```
+
+## Troubleshooting cepat
+
+| Gejala | Cek |
+|---|---|
+| `curl /health` gagal di laptop tapi OK di VPS | `sudo systemctl status caddy`; security group 443; DNS |
+| Sertifikat gagal terbit | Port 80 terbuka? DNS mengarah IP EC2? `sudo journalctl -u caddy -n 50` |
+| Preflight 404 | Endpoint registrasi ≠ path aktual — ingat `handle_path` membuang `/gatekeeper` |
+| Service mati terus | `journalctl -u gatekeeper -n 50`; `node -v` ≥ 20? `.env` lengkap? |
+| Semua REJECT `CIRCUIT_MISMATCH` | `EXPECTED_VK_HASH` di `.env` salah — default sudah benar dari repo |
