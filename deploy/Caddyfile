@@ -1,14 +1,28 @@
-# Caddyfile — reverse proxy dengan HTTPS otomatis (Let's Encrypt)
+# Caddyfile — reverse proxy HTTPS otomatis (Let's Encrypt) untuk DUA agent
 # Letakkan di VPS: /etc/caddy/Caddyfile
-# Ganti namakamu.duckdns.org dengan domain kamu.
+#
+# Pola: dua proses, dua port, satu domain.
+#   /gatekeeper/* → agent Proof Gatekeeper  (port 8080)
+#   /vfy/*        → agent Steal the VFY     (port 8081, diisi nanti)
+#
+# handle_path MEMBUANG prefix: POST /gatekeeper/agent sampai ke agent
+# sebagai /agent — jadi AGENT_PATH=/agent di .env masing-masing agent.
 
-namakamu.duckdns.org {
-	# HTTPS otomatis oleh Caddy. Tidak ada konfigurasi sertifikat manual.
+0xmurasaki.duckdns.org {
+	handle_path /gatekeeper/* {
+		reverse_proxy 127.0.0.1:8080
+	}
 
-	reverse_proxy 127.0.0.1:8080 {
-		# Envelope task kecil; tetap pasang guard sanely
-		request_body {
-			max_size 1MB
-		}
+	handle_path /vfy/* {
+		reverse_proxy 127.0.0.1:8081
+	}
+
+	# Health check langsung (opsional, tanpa prefix)
+	handle /health {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle {
+		respond "not found" 404
 	}
 }
