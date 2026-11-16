@@ -1,0 +1,23 @@
+# Secrets — never commit
+.env
+*.pem
+*.key
+
+# Build output
+dist/
+
+# Dependencies
+node_modules/
+
+# Runtime state (proof-reuse store)
+data/
+
+# Local research scratch scripts (not needed in the public repo)
+scratch/
+
+# Logs
+*.log
+
+# OS cruft
+.DS_Store
+Thumbs.db

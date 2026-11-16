@@ -1,0 +1,14 @@
+# Caddyfile — reverse proxy dengan HTTPS otomatis (Let's Encrypt)
+# Letakkan di VPS: /etc/caddy/Caddyfile
+# Ganti namakamu.duckdns.org dengan domain kamu.
+
+namakamu.duckdns.org {
+	# HTTPS otomatis oleh Caddy. Tidak ada konfigurasi sertifikat manual.
+
+	reverse_proxy 127.0.0.1:8080 {
+		# Envelope task kecil; tetap pasang guard sanely
+		request_body {
+			max_size 1MB
+		}
+	}
+}
